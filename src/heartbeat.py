@@ -403,7 +403,11 @@ class Monitor:
 
         if not silent:
             self.report(newly_down, newly_up, now)
-
+        status = ", ".join(
+            f"{h.name}={'up' if h.up else 'DOWN'}" for h in self.hosts
+        )
+        LOG.info("cycle complete — tunnel=%s | %s",
+                 "up" if self.tunnel_up else "DOWN", status)
         self.save_state()
 
     # --- Reporting --------------------------------------------------------
