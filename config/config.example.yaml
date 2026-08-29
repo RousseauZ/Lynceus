@@ -1,8 +1,8 @@
 # config.yaml — settings for the monitor itself.
 # The list of machines lives in hosts.yaml.
 #
-# Copy this to config.yaml and fill in your own values.
-# config.yaml is gitignored because it holds the webhook URL.
+# Copy this to /etc/heartbeat/config.yaml and fill in your own values.
+# The real file is never committed: it holds the webhook and broker password.
 
 general:
   # Seconds between check rounds.
@@ -17,29 +17,43 @@ general:
   # missed at night is still visible in the morning.
   reminder_hours: 6
 
-  # Where the last known state is kept, so restarting the service does not
-  # replay alerts for things that were already down.
+  # A gap longer than this between the last saved state and startup counts
+  # as "the monitor was away" rather than a quick service restart.
+  # Defaults to four missed cycles when omitted.
+  startup_gap_threshold: 240
+
   state_file: /var/lib/heartbeat/state.json
 
 wireguard:
-  # Interface name, matching /etc/wireguard/<name>.conf
   interface: wg0
 
-  # A handshake older than this many seconds counts as no connection.
-  # WireGuard rehandshakes about every 2 minutes when there is traffic,
-  # so anything under 120 will produce false alarms.
+  # A handshake older than this counts as no connection. WireGuard
+  # rehandshakes about every 2 minutes when there is traffic, so anything
+  # under 120 will produce false alarms.
   handshake_max_age: 180
 
   # An address inside the tunnel, pinged before reading the handshake age.
   # WireGuard stays silent until there is traffic, so without this a healthy
   # tunnel can look stale simply because nothing was sent.
-  # Use the tunnel IP of your WireGuard server.
-  nudge_target: 10.10.0.1
+  nudge_target: 10.0.0.1
 
 discord:
-  # Server settings -> Integrations -> Webhooks -> New Webhook -> Copy URL.
-  # Treat this like a password: anyone holding it can post in your channel.
-  webhook_url: https://discord.com/api/webhooks/changethis/to/your/webhook
-
-  # Display name on the messages.
+  # Server settings -> Integrations -> Webhooks -> Copy URL.
+  # Treat this like a password.
+  webhook_url: https://discord.com/api/webhooks/CHANGE/ME
   username: Heartbeat
+
+mqtt:
+  # Optional. Mirrors the monitor's own health to Home Assistant so you get
+  # told when this Pi dies. Set enabled to false to run without it —
+  # Discord alerting does not depend on the broker.
+  enabled: true
+
+  host: 192.168.1.110
+  port: 1883
+  username: heartbeat
+  password: CHANGE_ME
+
+  base_topic: heartbeat
+  discovery_prefix: homeassistant
+  node_id: heartbeat

@@ -13,8 +13,9 @@ would report down for a single underlying cause.
 On startup it reports how long it was away and what changed while it was
 gone, so a power cut at the monitor's own location does not pass silently.
 
-Alerts go to a Discord webhook. State is kept on disk so a restart of the
-service does not replay old alerts.
+Alerts go to a Discord webhook. Status is optionally mirrored to MQTT for
+Home Assistant. MQTT is deliberately optional and never blocks alerting:
+Discord has to keep working when the broker does not.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -36,6 +38,12 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+try:
+    import paho.mqtt.client as mqtt
+    MQTT_AVAILABLE = True
+except ImportError:
+    MQTT_AVAILABLE = False
 
 LOG = logging.getLogger("heartbeat")
 STOP = threading.Event()
@@ -149,6 +157,58 @@ def nudge_tunnel(target: str) -> None:
 
 
 # --------------------------------------------------------------------------
+# Local hardware
+# --------------------------------------------------------------------------
+
+def cpu_temperature() -> float | None:
+    """CPU temperature in degrees Celsius, or None if unavailable."""
+    try:
+        raw = Path("/sys/class/thermal/thermal_zone0/temp").read_text().strip()
+        return round(int(raw) / 1000, 1)
+    except (OSError, ValueError):
+        return None
+
+
+def throttle_flags() -> dict[str, bool] | None:
+    """
+    Read the Raspberry Pi throttling bitmask.
+
+    Bit 0  : undervoltage right now
+    Bit 1  : ARM frequency capped right now
+    Bit 2  : throttled right now
+    Bit 16 : undervoltage has occurred since boot
+    Bit 18 : throttling has occurred since boot
+
+    The "since boot" bits matter most for an unattended machine: a marginal
+    power supply shows up there long before it causes visible trouble.
+    """
+    try:
+        result = subprocess.run(
+            ["vcgencmd", "get_throttled"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    match = re.search(r"0x([0-9a-fA-F]+)", result.stdout)
+    if not match:
+        return None
+
+    value = int(match.group(1), 16)
+    return {
+        "undervoltage_now": bool(value & 0x1),
+        "throttled_now": bool(value & 0x4),
+        "undervoltage_since_boot": bool(value & 0x10000),
+        "throttled_since_boot": bool(value & 0x40000),
+    }
+
+
+# --------------------------------------------------------------------------
 # Notifications
 # --------------------------------------------------------------------------
 
@@ -213,6 +273,182 @@ class Discord:
         self.send(title, description, self.COLOUR_INFO)
 
 
+# --------------------------------------------------------------------------
+# MQTT / Home Assistant
+# --------------------------------------------------------------------------
+
+class MqttPublisher:
+    """
+    Mirrors the monitor's own health to Home Assistant.
+
+    This publishes six entities describing the monitor, not the hosts it
+    watches — those are already covered by Discord alerts. The point here is
+    the other half of the failover: if this Pi dies, Home Assistant notices
+    the availability topic go stale and can tell you.
+
+    Every failure is swallowed and logged. A broken broker must never stop
+    the checks or the Discord alerts.
+    """
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        self.enabled = bool(config.get("enabled", False)) and bool(config.get("host"))
+        if not self.enabled:
+            return
+
+        if not MQTT_AVAILABLE:
+            LOG.error("mqtt enabled but paho-mqtt is not installed, disabling")
+            self.enabled = False
+            return
+
+        self.host: str = config["host"]
+        self.port: int = int(config.get("port", 1883))
+        self.username: str | None = config.get("username")
+        self.password: str | None = config.get("password")
+        self.base: str = config.get("base_topic", "heartbeat").rstrip("/")
+        self.discovery: str = config.get("discovery_prefix", "homeassistant").rstrip("/")
+        self.node: str = config.get("node_id", "heartbeat")
+
+        self.availability_topic = f"{self.base}/availability"
+        self.state_topic = f"{self.base}/state"
+        self.connected = False
+        self.discovery_sent = False
+
+        self.client = mqtt.Client(
+            mqtt.CallbackAPIVersion.VERSION2,
+            client_id=f"heartbeat-{socket.gethostname()}",
+        )
+        if self.username:
+            self.client.username_pw_set(self.username, self.password)
+
+        # If this Pi drops off, Home Assistant sees it within seconds
+        self.client.will_set(self.availability_topic, "offline", qos=1, retain=True)
+        self.client.on_connect = self._on_connect
+        self.client.on_disconnect = self._on_disconnect
+
+    def start(self) -> None:
+        if not self.enabled:
+            return
+        try:
+            self.client.connect_async(self.host, self.port, keepalive=60)
+            self.client.loop_start()
+            LOG.info("mqtt: connecting to %s:%s", self.host, self.port)
+        except Exception as exc:
+            LOG.error("mqtt: could not start client: %s", exc)
+            self.enabled = False
+
+    def _on_connect(self, client, userdata, flags, reason_code, properties=None) -> None:
+        if reason_code == 0:
+            self.connected = True
+            LOG.info("mqtt: connected")
+            client.publish(self.availability_topic, "online", qos=1, retain=True)
+            self.publish_discovery()
+        else:
+            LOG.error("mqtt: connection refused (%s)", reason_code)
+
+    def _on_disconnect(self, client, userdata, flags, reason_code, properties=None) -> None:
+        self.connected = False
+        if not STOP.is_set():
+            LOG.warning("mqtt: disconnected (%s), will retry", reason_code)
+
+    # --- Discovery --------------------------------------------------------
+
+    def _device(self) -> dict[str, Any]:
+        return {
+            "identifiers": [self.node],
+            "name": "Heartbeat monitor",
+            "manufacturer": "Self-built",
+            "model": "Offsite monitor",
+        }
+
+    def _entity(self, component: str, key: str, config: dict[str, Any]) -> None:
+        config.setdefault("availability_topic", self.availability_topic)
+        config.setdefault("state_topic", self.state_topic)
+        config["unique_id"] = f"{self.node}_{key}"
+        config["object_id"] = f"{self.node}_{key}"
+        config["device"] = self._device()
+
+        topic = f"{self.discovery}/{component}/{self.node}/{key}/config"
+        self.client.publish(topic, json.dumps(config), qos=1, retain=True)
+
+    def publish_discovery(self) -> None:
+        """Announce the entities so Home Assistant creates them by itself."""
+        try:
+            self._entity("binary_sensor", "tunnel", {
+                "name": "Tunnel",
+                "value_template": "{{ value_json.tunnel_up }}",
+                "payload_on": "True",
+                "payload_off": "False",
+                "device_class": "connectivity",
+            })
+
+            self._entity("sensor", "hosts_up", {
+                "name": "Hosts up",
+                "value_template": "{{ value_json.hosts_up }}",
+                "state_class": "measurement",
+                "icon": "mdi:server-network",
+            })
+
+            self._entity("sensor", "hosts_down", {
+                "name": "Hosts down",
+                "value_template": "{{ value_json.hosts_down_names }}",
+                "icon": "mdi:server-network-off",
+            })
+
+            self._entity("sensor", "temperature", {
+                "name": "CPU temperature",
+                "value_template": "{{ value_json.cpu_temperature }}",
+                "unit_of_measurement": "°C",
+                "device_class": "temperature",
+                "state_class": "measurement",
+            })
+
+            self._entity("binary_sensor", "undervoltage", {
+                "name": "Undervoltage",
+                "value_template": "{{ value_json.undervoltage_since_boot }}",
+                "payload_on": "True",
+                "payload_off": "False",
+                "device_class": "problem",
+            })
+
+            self._entity("sensor", "last_check", {
+                "name": "Last check",
+                "value_template": "{{ value_json.last_check }}",
+                "device_class": "timestamp",
+            })
+
+            self.discovery_sent = True
+            LOG.info("mqtt: discovery published")
+        except Exception as exc:
+            LOG.error("mqtt: could not publish discovery: %s", exc)
+
+    # --- State ------------------------------------------------------------
+
+    def publish_state(self, payload: dict[str, Any]) -> None:
+        if not self.enabled or not self.connected:
+            return
+        try:
+            self.client.publish(
+                self.state_topic, json.dumps(payload), qos=0, retain=True
+            )
+        except Exception as exc:
+            LOG.error("mqtt: could not publish state: %s", exc)
+
+    def shutdown(self) -> None:
+        if not self.enabled:
+            return
+        try:
+            self.client.publish(self.availability_topic, "offline", qos=1, retain=True)
+            time.sleep(0.3)
+            self.client.loop_stop()
+            self.client.disconnect()
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+
 def humanize(seconds: float) -> str:
     """Turn a duration into something readable in a chat message."""
     seconds = int(seconds)
@@ -258,6 +494,8 @@ class Monitor:
             discord_cfg.get("username", "Heartbeat"),
         )
 
+        self.mqtt = MqttPublisher(config.get("mqtt", {}))
+
         self.state_file = Path(
             general.get("state_file", "/var/lib/heartbeat/state.json")
         )
@@ -276,7 +514,6 @@ class Monitor:
         # the startup report. Filled in by load_state().
         self.previous_seen: float | None = None
         self.previous_down: list[str] = []
-        self.previous_tunnel_up: bool | None = None
         self.had_previous_state = False
 
         self.load_state()
@@ -297,10 +534,8 @@ class Monitor:
 
         self.had_previous_state = True
 
-        # When did we last manage to write anything down?
         self.previous_seen = data.get("last_seen")
         if self.previous_seen is None:
-            # Older state files only had an ISO timestamp
             updated = data.get("updated")
             if updated:
                 try:
@@ -311,7 +546,6 @@ class Monitor:
         self.tunnel_up = data.get("tunnel_up")
         self.tunnel_down_since = data.get("tunnel_down_since")
         self.tunnel_last_reminder = data.get("tunnel_last_reminder")
-        self.previous_tunnel_up = self.tunnel_up
 
         saved_hosts = data.get("hosts", {})
         for host in self.hosts:
@@ -413,6 +647,7 @@ class Monitor:
         # No point checking hosts we cannot reach
         if self.tunnel_up is False:
             LOG.info("tunnel down, skipping host checks")
+            self.publish_mqtt_state()
             self.save_state()
             return
 
@@ -451,7 +686,31 @@ class Monitor:
         LOG.debug("cycle complete — tunnel=%s | %s",
                   "up" if self.tunnel_up else "DOWN", status)
 
+        self.publish_mqtt_state()
         self.save_state()
+
+    # --- MQTT -------------------------------------------------------------
+
+    def publish_mqtt_state(self) -> None:
+        if not self.mqtt.enabled:
+            return
+
+        down_names = [h.name for h in self.hosts if h.up is False]
+        flags = throttle_flags() or {}
+
+        payload = {
+            "tunnel_up": bool(self.tunnel_up),
+            "hosts_total": len(self.hosts),
+            "hosts_up": len(self.hosts) - len(down_names),
+            "hosts_down": len(down_names),
+            "hosts_down_names": ", ".join(down_names) if down_names else "none",
+            "cpu_temperature": cpu_temperature(),
+            "undervoltage_now": flags.get("undervoltage_now", False),
+            "undervoltage_since_boot": flags.get("undervoltage_since_boot", False),
+            "throttled_since_boot": flags.get("throttled_since_boot", False),
+            "last_check": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        self.mqtt.publish_state(payload)
 
     # --- Reporting --------------------------------------------------------
 
@@ -468,10 +727,13 @@ class Monitor:
 
         lines: list[str] = []
 
-        # How long were we away?
-        if self.previous_seen:
+        if self.previous_seen is not None:
             gap = now - self.previous_seen
-            if gap >= self.gap_threshold:
+            if gap < 0:
+                # The Pi has no battery-backed clock, so on boot the time can
+                # briefly run ahead of reality until NTP corrects it.
+                lines.append("Restarted (clock had not synced yet, gap unknown)")
+            elif gap >= self.gap_threshold:
                 lines.append(
                     f"**Monitor was offline for {humanize(gap)}** "
                     f"(last check {local_time(self.previous_seen)})"
@@ -484,11 +746,8 @@ class Monitor:
             lines.append("First run, no previous state")
 
         lines.append("")
-
-        # Tunnel
         lines.append(f"**Tunnel:** {'up' if self.tunnel_up else 'DOWN'}")
 
-        # What was down before we lost sight of things
         if self.previous_down:
             lines.append(
                 f"**Was down before the gap:** {', '.join(self.previous_down)}"
@@ -496,21 +755,32 @@ class Monitor:
         elif self.had_previous_state:
             lines.append("**Was down before the gap:** nothing")
 
-        # What is down now
         if currently_down:
             lines.append(f"**Down now:** {', '.join(currently_down)}")
         else:
             lines.append(f"**Down now:** nothing — {up_count}/{len(self.hosts)} up")
 
-        # Anything that recovered while we were not looking
         recovered = [n for n in self.previous_down if n not in currently_down]
         if recovered:
             lines.append(f"**Recovered while offline:** {', '.join(recovered)}")
 
-        # Anything that failed while we were not looking
         newly = [n for n in currently_down if n not in self.previous_down]
         if newly and self.had_previous_state:
             lines.append(f"**Failed while offline:** {', '.join(newly)}")
+
+        # Hardware health is worth knowing about right after a restart:
+        # an unexpected reboot is often a power problem.
+        temp = cpu_temperature()
+        flags = throttle_flags() or {}
+        hardware = []
+        if temp is not None:
+            hardware.append(f"{temp} °C")
+        if flags.get("undervoltage_since_boot"):
+            hardware.append("undervoltage detected")
+        if flags.get("throttled_since_boot"):
+            hardware.append("has been throttled")
+        if hardware:
+            lines.append(f"**Pi:** {', '.join(hardware)}")
 
         colour = Discord.COLOUR_UP if not currently_down and self.tunnel_up \
             else Discord.COLOUR_INFO
@@ -588,6 +858,8 @@ class Monitor:
             len(self.hosts), self.interval, self.threshold,
         )
 
+        self.mqtt.start()
+
         # Establish a baseline without alerting, so a restart does not produce
         # a flood of individual messages. The startup report below covers what
         # changed in one go instead.
@@ -614,6 +886,7 @@ class Monitor:
 
         LOG.info("shutting down")
         self.save_state()
+        self.mqtt.shutdown()
 
 
 # --------------------------------------------------------------------------
