@@ -10,6 +10,9 @@ Checks two layers:
 If the handshake is stale the host checks are skipped, because everything
 would report down for a single underlying cause.
 
+On startup it reports how long it was away and what changed while it was
+gone, so a power cut at the monitor's own location does not pass silently.
+
 Alerts go to a Discord webhook. State is kept on disk so a restart of the
 service does not replay old alerts.
 """
@@ -174,6 +177,7 @@ class Discord:
                 }
             ],
         }
+
         request = urllib.request.Request(
             self.webhook_url,
             data=json.dumps(payload).encode("utf-8"),
@@ -183,6 +187,7 @@ class Discord:
             },
             method="POST",
         )
+
         for attempt in range(3):
             try:
                 with urllib.request.urlopen(request, timeout=10):
@@ -220,6 +225,11 @@ def humanize(seconds: float) -> str:
     return f"{seconds // 86400}d {(seconds % 86400) // 3600}h"
 
 
+def local_time(epoch: float) -> str:
+    """Format an epoch timestamp in the machine's local timezone."""
+    return datetime.fromtimestamp(epoch).strftime("%d %b %H:%M")
+
+
 # --------------------------------------------------------------------------
 # Monitor
 # --------------------------------------------------------------------------
@@ -230,6 +240,12 @@ class Monitor:
         self.interval: int = int(general.get("interval", 60))
         self.threshold: int = int(general.get("failure_threshold", 3))
         self.reminder_seconds: int = int(general.get("reminder_hours", 6)) * 3600
+
+        # A gap larger than this counts as "the monitor was away" rather than
+        # a quick service restart. Defaults to four missed cycles.
+        self.gap_threshold: int = int(
+            general.get("startup_gap_threshold", self.interval * 4)
+        )
 
         wg = config.get("wireguard", {})
         self.interface: str = wg.get("interface", "wg0")
@@ -256,6 +272,13 @@ class Monitor:
         self.tunnel_down_since: float | None = None
         self.tunnel_last_reminder: float | None = None
 
+        # What the world looked like the last time we wrote state, used for
+        # the startup report. Filled in by load_state().
+        self.previous_seen: float | None = None
+        self.previous_down: list[str] = []
+        self.previous_tunnel_up: bool | None = None
+        self.had_previous_state = False
+
         self.load_state()
 
     # --- Persistence ------------------------------------------------------
@@ -272,9 +295,23 @@ class Monitor:
             LOG.warning("could not read state file, starting fresh: %s", exc)
             return
 
+        self.had_previous_state = True
+
+        # When did we last manage to write anything down?
+        self.previous_seen = data.get("last_seen")
+        if self.previous_seen is None:
+            # Older state files only had an ISO timestamp
+            updated = data.get("updated")
+            if updated:
+                try:
+                    self.previous_seen = datetime.fromisoformat(updated).timestamp()
+                except ValueError:
+                    pass
+
         self.tunnel_up = data.get("tunnel_up")
         self.tunnel_down_since = data.get("tunnel_down_since")
         self.tunnel_last_reminder = data.get("tunnel_last_reminder")
+        self.previous_tunnel_up = self.tunnel_up
 
         saved_hosts = data.get("hosts", {})
         for host in self.hosts:
@@ -284,12 +321,16 @@ class Monitor:
             host.up = saved.get("up")
             host.down_since = saved.get("down_since")
             host.last_reminder = saved.get("last_reminder")
+            if saved.get("up") is False:
+                self.previous_down.append(host.name)
 
         LOG.info("restored state from %s", self.state_file)
 
     def save_state(self) -> None:
+        now = time.time()
         data = {
             "updated": datetime.now(timezone.utc).isoformat(),
+            "last_seen": now,
             "tunnel_up": self.tunnel_up,
             "tunnel_down_since": self.tunnel_down_since,
             "tunnel_last_reminder": self.tunnel_last_reminder,
@@ -403,14 +444,79 @@ class Monitor:
 
         if not silent:
             self.report(newly_down, newly_up, now)
+
         status = ", ".join(
             f"{h.name}={'up' if h.up else 'DOWN'}" for h in self.hosts
         )
-        LOG.info("cycle complete — tunnel=%s | %s",
-                 "up" if self.tunnel_up else "DOWN", status)
+        LOG.debug("cycle complete — tunnel=%s | %s",
+                  "up" if self.tunnel_up else "DOWN", status)
+
         self.save_state()
 
     # --- Reporting --------------------------------------------------------
+
+    def startup_report(self) -> None:
+        """
+        Send one message describing the gap and what changed across it.
+
+        Sent after the silent baseline cycle, so it reflects the situation
+        as it is right now rather than as it was before the monitor stopped.
+        """
+        now = time.time()
+        currently_down = [h.name for h in self.hosts if h.up is False]
+        up_count = len(self.hosts) - len(currently_down)
+
+        lines: list[str] = []
+
+        # How long were we away?
+        if self.previous_seen:
+            gap = now - self.previous_seen
+            if gap >= self.gap_threshold:
+                lines.append(
+                    f"**Monitor was offline for {humanize(gap)}** "
+                    f"(last check {local_time(self.previous_seen)})"
+                )
+            else:
+                lines.append(f"Restarted after {humanize(gap)}")
+        elif self.had_previous_state:
+            lines.append("Restarted, previous downtime unknown")
+        else:
+            lines.append("First run, no previous state")
+
+        lines.append("")
+
+        # Tunnel
+        lines.append(f"**Tunnel:** {'up' if self.tunnel_up else 'DOWN'}")
+
+        # What was down before we lost sight of things
+        if self.previous_down:
+            lines.append(
+                f"**Was down before the gap:** {', '.join(self.previous_down)}"
+            )
+        elif self.had_previous_state:
+            lines.append("**Was down before the gap:** nothing")
+
+        # What is down now
+        if currently_down:
+            lines.append(f"**Down now:** {', '.join(currently_down)}")
+        else:
+            lines.append(f"**Down now:** nothing — {up_count}/{len(self.hosts)} up")
+
+        # Anything that recovered while we were not looking
+        recovered = [n for n in self.previous_down if n not in currently_down]
+        if recovered:
+            lines.append(f"**Recovered while offline:** {', '.join(recovered)}")
+
+        # Anything that failed while we were not looking
+        newly = [n for n in currently_down if n not in self.previous_down]
+        if newly and self.had_previous_state:
+            lines.append(f"**Failed while offline:** {', '.join(newly)}")
+
+        colour = Discord.COLOUR_UP if not currently_down and self.tunnel_up \
+            else Discord.COLOUR_INFO
+
+        self.discord.send("Monitor started", "\n".join(lines), colour)
+        LOG.info("startup report sent")
 
     def report(
         self,
@@ -419,12 +525,10 @@ class Monitor:
         now: float,
     ) -> None:
         if newly_down:
-            lines = [f"• **{h.name}** ({h.address})" for h in newly_down]
-            if any(h.note for h in newly_down):
-                lines = [
-                    f"• **{h.name}** ({h.address}){f' — {h.note}' if h.note else ''}"
-                    for h in newly_down
-                ]
+            lines = [
+                f"• **{h.name}** ({h.address}){f' — {h.note}' if h.note else ''}"
+                for h in newly_down
+            ]
             self.discord.down(
                 f"{len(newly_down)} host{'s' if len(newly_down) > 1 else ''} unreachable",
                 "\n".join(lines) + "\n\nThe tunnel is up, so this is the host itself.",
@@ -484,11 +588,14 @@ class Monitor:
             len(self.hosts), self.interval, self.threshold,
         )
 
-        # Establish a baseline without alerting, so a restart of the Pi does
-        # not produce a flood of messages for things that were already known.
+        # Establish a baseline without alerting, so a restart does not produce
+        # a flood of individual messages. The startup report below covers what
+        # changed in one go instead.
         LOG.info("running silent baseline cycle")
         self.run_cycle(silent=True)
         LOG.info("baseline established, alerts enabled")
+
+        self.startup_report()
 
         while not STOP.is_set():
             started = time.monotonic()
