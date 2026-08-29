@@ -1,0 +1,24 @@
+# hosts.yaml — the list of machines to monitor.
+#
+# Adding a host is three lines. Nothing else needs to change.
+#
+#   name      Shown in Discord alerts. Keep it short and recognisable.
+#   address   IP or hostname, reachable through the tunnel.
+#   check     "icmp" (ping) or "tcp" (open a connection to a port).
+#   port      Required for tcp, ignored for icmp.
+#   timeout   Seconds to wait. Default 3.
+#   enabled   Set to false to park a host without deleting it. Default true.
+#   note      Optional, appended to the alert. Useful for "call the landlord"
+#             style context.
+#
+# Use tcp when you care about a service rather than the machine: a host can
+# answer a ping while the service on it is dead.
+
+  hosts:
+  - name: Router
+    address: 192.168.1.1
+    check: icmp
+
+  - name: Hypervisor
+    address: 192.168.1.10
+    check: icmp

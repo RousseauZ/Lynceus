@@ -1,0 +1,37 @@
+[Unit]
+Description=Offsite heartbeat monitor
+After=network-online.target wg-quick@wg0.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+
+Environment=HEARTBEAT_CONFIG=/etc/heartbeat/config.yaml
+Environment=HEARTBEAT_HOSTS=/etc/heartbeat/hosts.yaml
+Environment=HEARTBEAT_LOGLEVEL=INFO
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/opt/heartbeat/venv/bin/python /opt/heartbeat/heartbeat.py
+
+Restart=always
+RestartSec=15
+TimeoutStopSec=20
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+LockPersonality=true
+ReadWritePaths=/var/lib/heartbeat
+ReadOnlyPaths=/etc/heartbeat
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=heartbeat
+
+[Install]
+WantedBy=multi-user.target
