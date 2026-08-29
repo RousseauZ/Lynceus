@@ -373,14 +373,6 @@ class MqttPublisher:
     def publish_discovery(self) -> None:
         """Announce the entities so Home Assistant creates them by itself."""
         try:
-            self._entity("binary_sensor", "tunnel", {
-                "name": "Tunnel",
-                "value_template": "{{ value_json.tunnel_up }}",
-                "payload_on": "True",
-                "payload_off": "False",
-                "device_class": "connectivity",
-            })
-
             self._entity("sensor", "hosts_up", {
                 "name": "Hosts up",
                 "value_template": "{{ value_json.hosts_up }}",
