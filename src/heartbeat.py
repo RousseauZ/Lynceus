@@ -33,7 +33,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -87,6 +87,7 @@ class Host:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=self.timeout + 2,
+                check=False,
             )
             return result.returncode == 0
         except (subprocess.TimeoutExpired, OSError):
@@ -120,6 +121,7 @@ def handshake_age(interface: str) -> float | None:
             capture_output=True,
             text=True,
             timeout=10,
+            check=False,
         )
     except (subprocess.TimeoutExpired, OSError) as exc:
         LOG.error("could not run wg show: %s", exc)
@@ -188,6 +190,7 @@ def throttle_flags() -> dict[str, bool] | None:
             capture_output=True,
             text=True,
             timeout=5,
+            check=False,
         )
     except (subprocess.TimeoutExpired, OSError):
         return None
@@ -233,12 +236,12 @@ class Discord:
                     "title": title,
                     "description": description,
                     "color": colour,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": datetime.now(UTC).isoformat(),
                 }
             ],
         }
 
-        request = urllib.request.Request(
+        request = urllib.request.Request(  # noqa: S310 - webhook url comes from our own config
             self.webhook_url,
             data=json.dumps(payload).encode("utf-8"),
             headers={
@@ -250,7 +253,7 @@ class Discord:
 
         for attempt in range(3):
             try:
-                with urllib.request.urlopen(request, timeout=10):
+                with urllib.request.urlopen(request, timeout=10):  # noqa: S310
                     return
             except urllib.error.HTTPError as exc:
                 if exc.code == 429 and attempt < 2:
@@ -287,7 +290,9 @@ class MqttPublisher:
     the availability topic go stale and can tell you.
 
     Every failure is swallowed and logged. A broken broker must never stop
-    the checks or the Discord alerts.
+    the checks or the Discord alerts. That is why the handlers below catch
+    Exception broadly and carry a BLE001 exemption: paho raises a wide range
+    of errors depending on the transport, and none of them may be fatal here.
     """
 
     def __init__(self, config: dict[str, Any]) -> None:
@@ -332,7 +337,7 @@ class MqttPublisher:
             self.client.connect_async(self.host, self.port, keepalive=60)
             self.client.loop_start()
             LOG.info("mqtt: connecting to %s:%s", self.host, self.port)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - mqtt is optional, never fatal
             LOG.error("mqtt: could not start client: %s", exc)
             self.enabled = False
 
@@ -410,7 +415,7 @@ class MqttPublisher:
 
             self.discovery_sent = True
             LOG.info("mqtt: discovery published")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - mqtt is optional, never fatal
             LOG.error("mqtt: could not publish discovery: %s", exc)
 
     # --- State ------------------------------------------------------------
@@ -422,7 +427,7 @@ class MqttPublisher:
             self.client.publish(
                 self.state_topic, json.dumps(payload), qos=0, retain=True
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - mqtt is optional, never fatal
             LOG.error("mqtt: could not publish state: %s", exc)
 
     def shutdown(self) -> None:
@@ -433,8 +438,8 @@ class MqttPublisher:
             time.sleep(0.3)
             self.client.loop_stop()
             self.client.disconnect()
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - shutdown must never raise
+            LOG.debug("mqtt: error while shutting down: %s", exc)
 
 
 # --------------------------------------------------------------------------
@@ -494,7 +499,8 @@ class Monitor:
 
         self.hosts = [h for h in hosts if h.enabled]
         if not self.hosts:
-            raise ValueError("no enabled hosts found in hosts.yaml")
+            msg = "no enabled hosts found in hosts.yaml"
+            raise ValueError(msg)
 
         # Tunnel state
         self.tunnel_up: bool | None = None
@@ -533,7 +539,7 @@ class Monitor:
                 try:
                     self.previous_seen = datetime.fromisoformat(updated).timestamp()
                 except ValueError:
-                    pass
+                    LOG.debug("state file has an unparseable 'updated' value")
 
         self.tunnel_up = data.get("tunnel_up")
         self.tunnel_down_since = data.get("tunnel_down_since")
@@ -555,7 +561,7 @@ class Monitor:
     def save_state(self) -> None:
         now = time.time()
         data = {
-            "updated": datetime.now(timezone.utc).isoformat(),
+            "updated": datetime.now(UTC).isoformat(),
             "last_seen": now,
             "tunnel_up": self.tunnel_up,
             "tunnel_down_since": self.tunnel_down_since,
@@ -700,7 +706,7 @@ class Monitor:
             "undervoltage_now": flags.get("undervoltage_now", False),
             "undervoltage_since_boot": flags.get("undervoltage_since_boot", False),
             "throttled_since_boot": flags.get("throttled_since_boot", False),
-            "last_check": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "last_check": datetime.now(UTC).isoformat(timespec="seconds"),
         }
         self.mqtt.publish_state(payload)
 
