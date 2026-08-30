@@ -31,4 +31,9 @@ jobs:
         run: |
           python -c "import yaml; yaml.safe_load(open('config/config.example.yaml')); print('config OK')"
           python -c "import yaml; yaml.safe_load(open('config/hosts.example.yaml')); print('hosts OK')"
+  
+      - name: Lint
+        run: |
+          pip install ruff
+          ruff check src/
 
