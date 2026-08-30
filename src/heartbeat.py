@@ -460,7 +460,9 @@ def humanize(seconds: float) -> str:
 
 def local_time(epoch: float) -> str:
     """Format an epoch timestamp in the machine's local timezone."""
-    return datetime.fromtimestamp(epoch).strftime("%d %b %H:%M")
+    # Parsed as UTC and then converted, so the timezone is explicit rather
+    # than implied by the process environment.
+    return datetime.fromtimestamp(epoch, tz=UTC).astimezone().strftime("%d %b %H:%M")
 
 
 # --------------------------------------------------------------------------
