@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-heartbeat.py — offsite monitor.
+Lynceus.py — offsite monitor.
 
 Checks two layers:
   1. The WireGuard handshake, which tells us whether the connection to the
@@ -45,11 +45,11 @@ try:
 except ImportError:
     MQTT_AVAILABLE = False
 
-LOG = logging.getLogger("heartbeat")
+LOG = logging.getLogger("Lynceus")
 STOP = threading.Event()
 
-CONFIG_PATH = Path(os.environ.get("HEARTBEAT_CONFIG", "/etc/heartbeat/config.yaml"))
-HOSTS_PATH = Path(os.environ.get("HEARTBEAT_HOSTS", "/etc/heartbeat/hosts.yaml"))
+CONFIG_PATH = Path(os.environ.get("Lynceus_CONFIG", "/etc/Lynceus/config.yaml"))
+HOSTS_PATH = Path(os.environ.get("Lynceus_HOSTS", "/etc/Lynceus/hosts.yaml"))
 
 
 # --------------------------------------------------------------------------
@@ -220,7 +220,7 @@ class Discord:
     COLOUR_UP = 0x2ECC71
     COLOUR_INFO = 0x3498DB
 
-    def __init__(self, webhook_url: str, username: str = "Heartbeat") -> None:
+    def __init__(self, webhook_url: str, username: str = "Lynceus") -> None:
         self.webhook_url = webhook_url
         self.username = username
 
@@ -246,7 +246,7 @@ class Discord:
             data=json.dumps(payload).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
-                "User-Agent": "heartbeat-monitor/1.0",
+                "User-Agent": "Lynceus-monitor/1.0",
             },
             method="POST",
         )
@@ -309,9 +309,9 @@ class MqttPublisher:
         self.port: int = int(config.get("port", 1883))
         self.username: str | None = config.get("username")
         self.password: str | None = config.get("password")
-        self.base: str = config.get("base_topic", "heartbeat").rstrip("/")
+        self.base: str = config.get("base_topic", "Lynceus").rstrip("/")
         self.discovery: str = config.get("discovery_prefix", "homeassistant").rstrip("/")
-        self.node: str = config.get("node_id", "heartbeat")
+        self.node: str = config.get("node_id", "Lynceus")
 
         self.availability_topic = f"{self.base}/availability"
         self.state_topic = f"{self.base}/state"
@@ -320,7 +320,7 @@ class MqttPublisher:
 
         self.client = mqtt.Client(
             mqtt.CallbackAPIVersion.VERSION2,
-            client_id=f"heartbeat-{socket.gethostname()}",
+            client_id=f"Lynceus-{socket.gethostname()}",
         )
         if self.username:
             self.client.username_pw_set(self.username, self.password)
@@ -360,7 +360,7 @@ class MqttPublisher:
     def _device(self) -> dict[str, Any]:
         return {
             "identifiers": [self.node],
-            "name": "Heartbeat monitor",
+            "name": "Lynceus monitor",
             "manufacturer": "Self-built",
             "model": "Offsite monitor",
         }
@@ -490,13 +490,13 @@ class Monitor:
         discord_cfg = config.get("discord", {})
         self.discord = Discord(
             discord_cfg.get("webhook_url", ""),
-            discord_cfg.get("username", "Heartbeat"),
+            discord_cfg.get("username", "Lynceus"),
         )
 
         self.mqtt = MqttPublisher(config.get("mqtt", {}))
 
         self.state_file = Path(
-            general.get("state_file", "/var/lib/heartbeat/state.json")
+            general.get("state_file", "/var/lib/Lynceus/state.json")
         )
 
         self.hosts = [h for h in hosts if h.enabled]
@@ -946,7 +946,7 @@ def handle_signal(signum, frame) -> None:
 
 def main() -> int:
     logging.basicConfig(
-        level=os.environ.get("HEARTBEAT_LOGLEVEL", "INFO").upper(),
+        level=os.environ.get("Lynceus_LOGLEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)-7s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
