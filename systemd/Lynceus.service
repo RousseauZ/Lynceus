@@ -1,5 +1,5 @@
 [Unit]
-Description=Offsite heartbeat monitor
+Description=Lynceus
 After=network-online.target wg-quick@wg0.service
 Wants=network-online.target
 
@@ -7,12 +7,12 @@ Wants=network-online.target
 Type=simple
 User=root
 
-Environment=HEARTBEAT_CONFIG=/etc/heartbeat/config.yaml
-Environment=HEARTBEAT_HOSTS=/etc/heartbeat/hosts.yaml
-Environment=HEARTBEAT_LOGLEVEL=INFO
+Environment=Lynceus_CONFIG=/etc/Lynceus/config.yaml
+Environment=Lynceus_HOSTS=/etc/Lynceus/hosts.yaml
+Environment=Lynceus_LOGLEVEL=INFO
 Environment=PYTHONUNBUFFERED=1
 
-ExecStart=/opt/heartbeat/venv/bin/python /opt/heartbeat/heartbeat.py
+ExecStart=/opt/Lynceus/venv/bin/python /opt/Lynceus/Lynceus.py
 
 Restart=always
 RestartSec=15
@@ -26,12 +26,12 @@ ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictRealtime=true
 LockPersonality=true
-ReadWritePaths=/var/lib/heartbeat
-ReadOnlyPaths=/etc/heartbeat
+ReadWritePaths=/var/lib/Lynceus
+ReadOnlyPaths=/etc/Lynceus
 
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=heartbeat
+SyslogIdentifier=Lynceus
 
 [Install]
 WantedBy=multi-user.target
