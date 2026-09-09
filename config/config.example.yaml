@@ -1,7 +1,7 @@
 # config.yaml — settings for the monitor itself.
 # The list of machines lives in hosts.yaml.
 #
-# Copy this to /etc/heartbeat/config.yaml and fill in your own values.
+# Copy this to /etc/Lynceus/config.yaml and fill in your own values.
 # The real file is never committed: it holds the webhook and broker password.
 
 general:
@@ -22,7 +22,7 @@ general:
   # Defaults to four missed cycles when omitted.
   startup_gap_threshold: 240
 
-  state_file: /var/lib/heartbeat/state.json
+  state_file: /var/lib/Lynceus/state.json
 
 wireguard:
   interface: wg0
@@ -41,7 +41,7 @@ discord:
   # Server settings -> Integrations -> Webhooks -> Copy URL.
   # Treat this like a password.
   webhook_url: https://discord.com/api/webhooks/CHANGE/ME
-  username: Heartbeat
+  username: Lynceus
 
 mqtt:
   # Optional. Mirrors the monitor's own health to Home Assistant so you get
@@ -51,9 +51,9 @@ mqtt:
 
   host: 192.168.1.110
   port: 1883
-  username: heartbeat
+  username: Lynceus
   password: CHANGE_ME
 
-  base_topic: heartbeat
+  base_topic: Lynceus
   discovery_prefix: homeassistant
-  node_id: heartbeat
+  node_id: Lynceus
