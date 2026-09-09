@@ -1,6 +1,5 @@
-#!/usr/bin/env python3
 """
-Lynceus.py — offsite monitor.
+Lynceus — offsite monitor.
 
 Checks two layers:
   1. The WireGuard handshake, which tells us whether the connection to the
@@ -45,11 +44,11 @@ try:
 except ImportError:
     MQTT_AVAILABLE = False
 
-LOG = logging.getLogger("Lynceus")
+LOG = logging.getLogger("lynceus")
 STOP = threading.Event()
 
-CONFIG_PATH = Path(os.environ.get("Lynceus_CONFIG", "/etc/Lynceus/config.yaml"))
-HOSTS_PATH = Path(os.environ.get("Lynceus_HOSTS", "/etc/Lynceus/hosts.yaml"))
+CONFIG_PATH = Path(os.environ.get("LYNCEUS_CONFIG", "/etc/lynceus/config.yaml"))
+HOSTS_PATH = Path(os.environ.get("LYNCEUS_HOSTS", "/etc/lynceus/hosts.yaml"))
 
 
 # --------------------------------------------------------------------------
@@ -241,19 +240,20 @@ class Discord:
             ],
         }
 
-        request = urllib.request.Request(  # noqa: S310 - webhook url comes from our own config
+        # The webhook url comes from our own config file, not from user input.
+        request = urllib.request.Request(
             self.webhook_url,
             data=json.dumps(payload).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
-                "User-Agent": "Lynceus-monitor/1.0",
+                "User-Agent": "lynceus-monitor/1.0",
             },
             method="POST",
         )
 
         for attempt in range(3):
             try:
-                with urllib.request.urlopen(request, timeout=10):  # noqa: S310
+                with urllib.request.urlopen(request, timeout=10):
                     return
             except urllib.error.HTTPError as exc:
                 if exc.code == 429 and attempt < 2:
@@ -309,9 +309,9 @@ class MqttPublisher:
         self.port: int = int(config.get("port", 1883))
         self.username: str | None = config.get("username")
         self.password: str | None = config.get("password")
-        self.base: str = config.get("base_topic", "Lynceus").rstrip("/")
+        self.base: str = config.get("base_topic", "lynceus").rstrip("/")
         self.discovery: str = config.get("discovery_prefix", "homeassistant").rstrip("/")
-        self.node: str = config.get("node_id", "Lynceus")
+        self.node: str = config.get("node_id", "lynceus")
 
         self.availability_topic = f"{self.base}/availability"
         self.state_topic = f"{self.base}/state"
@@ -320,7 +320,7 @@ class MqttPublisher:
 
         self.client = mqtt.Client(
             mqtt.CallbackAPIVersion.VERSION2,
-            client_id=f"Lynceus-{socket.gethostname()}",
+            client_id=f"lynceus-{socket.gethostname()}",
         )
         if self.username:
             self.client.username_pw_set(self.username, self.password)
@@ -496,7 +496,7 @@ class Monitor:
         self.mqtt = MqttPublisher(config.get("mqtt", {}))
 
         self.state_file = Path(
-            general.get("state_file", "/var/lib/Lynceus/state.json")
+            general.get("state_file", "/var/lib/lynceus/state.json")
         )
 
         self.hosts = [h for h in hosts if h.enabled]
@@ -601,7 +601,7 @@ class Monitor:
         LOG.debug("handshake age: %.0fs", age)
         return age <= self.handshake_max_age
 
-    def run_cycle(self, silent: bool = False) -> None:
+    def run_cycle(self, *, silent: bool = False) -> None:
         """
         One full round of checks.
 
@@ -946,7 +946,7 @@ def handle_signal(signum, frame) -> None:
 
 def main() -> int:
     logging.basicConfig(
-        level=os.environ.get("Lynceus_LOGLEVEL", "INFO").upper(),
+        level=os.environ.get("LYNCEUS_LOGLEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)-7s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
