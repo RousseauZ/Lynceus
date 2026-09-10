@@ -34,12 +34,16 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
 
+if TYPE_CHECKING:
+    from types import FrameType
+
 try:
     import paho.mqtt.client as mqtt
+
     MQTT_AVAILABLE = True
 except ImportError:
     MQTT_AVAILABLE = False
@@ -50,10 +54,22 @@ STOP = threading.Event()
 CONFIG_PATH = Path(os.environ.get("LYNCEUS_CONFIG", "/etc/lynceus/config.yaml"))
 HOSTS_PATH = Path(os.environ.get("LYNCEUS_HOSTS", "/etc/lynceus/hosts.yaml"))
 
+# `wg show <if> latest-handshakes` prints "<peer-key> <unix-timestamp>" per peer.
+WG_HANDSHAKE_FIELDS = 2
+
+# Discord rate-limits aggressively; back off and retry rather than drop an alert.
+DISCORD_MAX_ATTEMPTS = 3
+HTTP_TOO_MANY_REQUESTS = 429
+
+SECONDS_PER_MINUTE = 60
+SECONDS_PER_HOUR = 3600
+SECONDS_PER_DAY = 86400
+
 
 # --------------------------------------------------------------------------
 # Data
 # --------------------------------------------------------------------------
+
 
 @dataclass
 class Host:
@@ -88,9 +104,10 @@ class Host:
                 timeout=self.timeout + 2,
                 check=False,
             )
-            return result.returncode == 0
         except (subprocess.TimeoutExpired, OSError):
             return False
+        else:
+            return result.returncode == 0
 
     def _probe_tcp(self) -> bool:
         if not self.port:
@@ -107,9 +124,10 @@ class Host:
 # WireGuard
 # --------------------------------------------------------------------------
 
+
 def handshake_age(interface: str) -> float | None:
     """
-    Seconds since the most recent WireGuard handshake on this interface.
+    Return seconds since the most recent WireGuard handshake on this interface.
 
     Returns None when the interface is missing or has never handshaked.
     Requires root, because `wg show` reads a privileged netlink interface.
@@ -122,8 +140,8 @@ def handshake_age(interface: str) -> float | None:
             timeout=10,
             check=False,
         )
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        LOG.error("could not run wg show: %s", exc)
+    except (subprocess.TimeoutExpired, OSError):
+        LOG.exception("could not run wg show")
         return None
 
     if result.returncode != 0:
@@ -133,7 +151,7 @@ def handshake_age(interface: str) -> float | None:
     newest = 0
     for line in result.stdout.strip().splitlines():
         parts = line.split()
-        if len(parts) >= 2 and parts[1].isdigit():
+        if len(parts) >= WG_HANDSHAKE_FIELDS and parts[1].isdigit():
             newest = max(newest, int(parts[1]))
 
     if newest == 0:
@@ -161,10 +179,11 @@ def nudge_tunnel(target: str) -> None:
 # Local hardware
 # --------------------------------------------------------------------------
 
+
 def cpu_temperature() -> float | None:
-    """CPU temperature in degrees Celsius, or None if unavailable."""
+    """Return the CPU temperature in degrees Celsius, or None if unavailable."""
     try:
-        raw = Path("/sys/class/thermal/thermal_zone0/temp").read_text().strip()
+        raw = Path("/sys/class/thermal/thermal_zone0/temp").read_text(encoding="utf-8").strip()
         return round(int(raw) / 1000, 1)
     except (OSError, ValueError):
         return None
@@ -214,16 +233,24 @@ def throttle_flags() -> dict[str, bool] | None:
 # Notifications
 # --------------------------------------------------------------------------
 
+
 class Discord:
+    """Sends embed messages to a Discord webhook, with retries on rate limits."""
+
     COLOUR_DOWN = 0xE74C3C
     COLOUR_UP = 0x2ECC71
     COLOUR_INFO = 0x3498DB
 
     def __init__(self, webhook_url: str, username: str = "Lynceus") -> None:
+        """Store the webhook, rejecting anything that is not an https:// url."""
+        if webhook_url and not webhook_url.startswith("https://"):
+            msg = "discord webhook_url must be an https:// url"
+            raise ValueError(msg)
         self.webhook_url = webhook_url
         self.username = username
 
     def send(self, title: str, description: str, colour: int) -> None:
+        """Post one embed, retrying on rate limits and transient network errors."""
         if not self.webhook_url:
             LOG.warning("no webhook configured, message dropped: %s", title)
             return
@@ -240,8 +267,9 @@ class Discord:
             ],
         }
 
-        # The webhook url comes from our own config file, not from user input.
-        request = urllib.request.Request(
+        # S310: the scheme is pinned to https:// in __init__, so this cannot be
+        # talked into opening file: or a custom scheme.
+        request = urllib.request.Request(  # noqa: S310
             self.webhook_url,
             data=json.dumps(payload).encode("utf-8"),
             headers={
@@ -251,28 +279,31 @@ class Discord:
             method="POST",
         )
 
-        for attempt in range(3):
+        for attempt in range(DISCORD_MAX_ATTEMPTS):
             try:
-                with urllib.request.urlopen(request, timeout=10):
+                with urllib.request.urlopen(request, timeout=10):  # noqa: S310
                     return
             except urllib.error.HTTPError as exc:
-                if exc.code == 429 and attempt < 2:
+                if exc.code == HTTP_TOO_MANY_REQUESTS and attempt < DISCORD_MAX_ATTEMPTS - 1:
                     time.sleep(5 * (attempt + 1))
                     continue
-                LOG.error("discord rejected the message: %s", exc)
+                LOG.exception("discord rejected the message")
                 return
-            except (urllib.error.URLError, OSError) as exc:
-                LOG.error("could not reach discord (attempt %d): %s", attempt + 1, exc)
-                if attempt < 2:
+            except (urllib.error.URLError, OSError):
+                LOG.exception("could not reach discord (attempt %d)", attempt + 1)
+                if attempt < DISCORD_MAX_ATTEMPTS - 1:
                     time.sleep(5)
 
     def down(self, title: str, description: str) -> None:
+        """Send a message in the "something is broken" colour."""
         self.send(title, description, self.COLOUR_DOWN)
 
     def up(self, title: str, description: str) -> None:
+        """Send a message in the "recovered" colour."""
         self.send(title, description, self.COLOUR_UP)
 
     def info(self, title: str, description: str) -> None:
+        """Send a neutral, informational message."""
         self.send(title, description, self.COLOUR_INFO)
 
 
@@ -280,22 +311,24 @@ class Discord:
 # MQTT / Home Assistant
 # --------------------------------------------------------------------------
 
+
 class MqttPublisher:
     """
     Mirrors the monitor's own health to Home Assistant.
 
-    This publishes six entities describing the monitor, not the hosts it
-    watches — those are already covered by Discord alerts. The point here is
-    the other half of the failover: if this Pi dies, Home Assistant notices
-    the availability topic go stale and can tell you.
+    This publishes entities describing the monitor, not the hosts it watches —
+    those are already covered by Discord alerts. The point here is the other
+    half of the failover: if this Pi dies, Home Assistant notices the
+    availability topic go stale and can tell you.
 
-    Every failure is swallowed and logged. A broken broker must never stop
-    the checks or the Discord alerts. That is why the handlers below catch
-    Exception broadly and carry a BLE001 exemption: paho raises a wide range
-    of errors depending on the transport, and none of them may be fatal here.
+    Every failure is swallowed and logged. A broken broker must never stop the
+    checks or the Discord alerts. That is why the handlers below catch Exception
+    broadly: paho raises a wide range of errors depending on the transport, and
+    none of them may be fatal here.
     """
 
     def __init__(self, config: dict[str, Any]) -> None:
+        """Read the mqtt section of the config and prepare the client."""
         self.enabled = bool(config.get("enabled", False)) and bool(config.get("host"))
         if not self.enabled:
             return
@@ -331,17 +364,25 @@ class MqttPublisher:
         self.client.on_disconnect = self._on_disconnect
 
     def start(self) -> None:
+        """Connect to the broker in the background, disabling mqtt if it fails."""
         if not self.enabled:
             return
         try:
             self.client.connect_async(self.host, self.port, keepalive=60)
             self.client.loop_start()
             LOG.info("mqtt: connecting to %s:%s", self.host, self.port)
-        except Exception as exc:  # noqa: BLE001 - mqtt is optional, never fatal
-            LOG.error("mqtt: could not start client: %s", exc)
+        except Exception:
+            LOG.exception("mqtt: could not start client")
             self.enabled = False
 
-    def _on_connect(self, client, userdata, flags, reason_code, properties=None) -> None:
+    def _on_connect(
+        self,
+        client: Any,  # noqa: ANN401 - paho hands us its own client type
+        _userdata: object,
+        _flags: object,
+        reason_code: object,
+        _properties: object = None,
+    ) -> None:
         if reason_code == 0:
             self.connected = True
             LOG.info("mqtt: connected")
@@ -350,7 +391,14 @@ class MqttPublisher:
         else:
             LOG.error("mqtt: connection refused (%s)", reason_code)
 
-    def _on_disconnect(self, client, userdata, flags, reason_code, properties=None) -> None:
+    def _on_disconnect(
+        self,
+        _client: object,
+        _userdata: object,
+        _flags: object,
+        reason_code: object,
+        _properties: object = None,
+    ) -> None:
         self.connected = False
         if not STOP.is_set():
             LOG.warning("mqtt: disconnected (%s), will retry", reason_code)
@@ -378,59 +426,79 @@ class MqttPublisher:
     def publish_discovery(self) -> None:
         """Announce the entities so Home Assistant creates them by itself."""
         try:
-            self._entity("sensor", "hosts_up", {
-                "name": "Hosts up",
-                "value_template": "{{ value_json.hosts_up }}",
-                "state_class": "measurement",
-                "icon": "mdi:server-network",
-            })
+            self._entity(
+                "sensor",
+                "hosts_up",
+                {
+                    "name": "Hosts up",
+                    "value_template": "{{ value_json.hosts_up }}",
+                    "state_class": "measurement",
+                    "icon": "mdi:server-network",
+                },
+            )
 
-            self._entity("sensor", "hosts_down", {
-                "name": "Hosts down",
-                "value_template": "{{ value_json.hosts_down_names }}",
-                "icon": "mdi:server-network-off",
-            })
+            self._entity(
+                "sensor",
+                "hosts_down",
+                {
+                    "name": "Hosts down",
+                    "value_template": "{{ value_json.hosts_down_names }}",
+                    "icon": "mdi:server-network-off",
+                },
+            )
 
-            self._entity("sensor", "temperature", {
-                "name": "CPU temperature",
-                "value_template": "{{ value_json.cpu_temperature }}",
-                "unit_of_measurement": "°C",
-                "device_class": "temperature",
-                "state_class": "measurement",
-            })
+            self._entity(
+                "sensor",
+                "temperature",
+                {
+                    "name": "CPU temperature",
+                    "value_template": "{{ value_json.cpu_temperature }}",
+                    "unit_of_measurement": "°C",
+                    "device_class": "temperature",
+                    "state_class": "measurement",
+                },
+            )
 
-            self._entity("binary_sensor", "undervoltage", {
-                "name": "Undervoltage",
-                "value_template": "{{ value_json.undervoltage_since_boot }}",
-                "payload_on": "True",
-                "payload_off": "False",
-                "device_class": "problem",
-            })
+            self._entity(
+                "binary_sensor",
+                "undervoltage",
+                {
+                    "name": "Undervoltage",
+                    "value_template": "{{ value_json.undervoltage_since_boot }}",
+                    "payload_on": "True",
+                    "payload_off": "False",
+                    "device_class": "problem",
+                },
+            )
 
-            self._entity("sensor", "last_check", {
-                "name": "Last check",
-                "value_template": "{{ value_json.last_check }}",
-                "device_class": "timestamp",
-            })
+            self._entity(
+                "sensor",
+                "last_check",
+                {
+                    "name": "Last check",
+                    "value_template": "{{ value_json.last_check }}",
+                    "device_class": "timestamp",
+                },
+            )
 
             self.discovery_sent = True
             LOG.info("mqtt: discovery published")
-        except Exception as exc:  # noqa: BLE001 - mqtt is optional, never fatal
-            LOG.error("mqtt: could not publish discovery: %s", exc)
+        except Exception:
+            LOG.exception("mqtt: could not publish discovery")
 
     # --- State ------------------------------------------------------------
 
     def publish_state(self, payload: dict[str, Any]) -> None:
+        """Publish the current monitor state, if the broker is connected."""
         if not self.enabled or not self.connected:
             return
         try:
-            self.client.publish(
-                self.state_topic, json.dumps(payload), qos=0, retain=True
-            )
-        except Exception as exc:  # noqa: BLE001 - mqtt is optional, never fatal
-            LOG.error("mqtt: could not publish state: %s", exc)
+            self.client.publish(self.state_topic, json.dumps(payload), qos=0, retain=True)
+        except Exception:
+            LOG.exception("mqtt: could not publish state")
 
     def shutdown(self) -> None:
+        """Mark the monitor offline and close the connection cleanly."""
         if not self.enabled:
             return
         try:
@@ -438,24 +506,27 @@ class MqttPublisher:
             time.sleep(0.3)
             self.client.loop_stop()
             self.client.disconnect()
-        except Exception as exc:  # noqa: BLE001 - shutdown must never raise
-            LOG.debug("mqtt: error while shutting down: %s", exc)
+        except Exception:
+            LOG.debug("mqtt: error while shutting down", exc_info=True)
 
 
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
 
+
 def humanize(seconds: float) -> str:
     """Turn a duration into something readable in a chat message."""
-    seconds = int(seconds)
-    if seconds < 60:
-        return f"{seconds}s"
-    if seconds < 3600:
-        return f"{seconds // 60}m"
-    if seconds < 86400:
-        return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
-    return f"{seconds // 86400}d {(seconds % 86400) // 3600}h"
+    total = int(seconds)
+    if total < SECONDS_PER_MINUTE:
+        return f"{total}s"
+    if total < SECONDS_PER_HOUR:
+        return f"{total // SECONDS_PER_MINUTE}m"
+    if total < SECONDS_PER_DAY:
+        minutes = (total % SECONDS_PER_HOUR) // SECONDS_PER_MINUTE
+        return f"{total // SECONDS_PER_HOUR}h {minutes}m"
+    hours = (total % SECONDS_PER_DAY) // SECONDS_PER_HOUR
+    return f"{total // SECONDS_PER_DAY}d {hours}h"
 
 
 def local_time(epoch: float) -> str:
@@ -469,18 +540,20 @@ def local_time(epoch: float) -> str:
 # Monitor
 # --------------------------------------------------------------------------
 
+
 class Monitor:
+    """Owns the check loop, the alerting decisions, and the persisted state."""
+
     def __init__(self, config: dict[str, Any], hosts: list[Host]) -> None:
+        """Build a monitor from the parsed config and host list."""
         general = config.get("general", {})
         self.interval: int = int(general.get("interval", 60))
         self.threshold: int = int(general.get("failure_threshold", 3))
-        self.reminder_seconds: int = int(general.get("reminder_hours", 6)) * 3600
+        self.reminder_seconds: int = int(general.get("reminder_hours", 6)) * SECONDS_PER_HOUR
 
         # A gap larger than this counts as "the monitor was away" rather than
         # a quick service restart. Defaults to four missed cycles.
-        self.gap_threshold: int = int(
-            general.get("startup_gap_threshold", self.interval * 4)
-        )
+        self.gap_threshold: int = int(general.get("startup_gap_threshold", self.interval * 4))
 
         wg = config.get("wireguard", {})
         self.interface: str = wg.get("interface", "wg0")
@@ -495,9 +568,7 @@ class Monitor:
 
         self.mqtt = MqttPublisher(config.get("mqtt", {}))
 
-        self.state_file = Path(
-            general.get("state_file", "/var/lib/lynceus/state.json")
-        )
+        self.state_file = Path(general.get("state_file", "/var/lib/lynceus/state.json"))
 
         self.hosts = [h for h in hosts if h.enabled]
         if not self.hosts:
@@ -528,8 +599,8 @@ class Monitor:
 
         try:
             data = json.loads(self.state_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            LOG.warning("could not read state file, starting fresh: %s", exc)
+        except (OSError, json.JSONDecodeError):
+            LOG.warning("could not read state file, starting fresh", exc_info=True)
             return
 
         self.had_previous_state = True
@@ -561,6 +632,7 @@ class Monitor:
         LOG.info("restored state from %s", self.state_file)
 
     def save_state(self) -> None:
+        """Write the current state atomically, so a crash cannot corrupt it."""
         now = time.time()
         data = {
             "updated": datetime.now(UTC).isoformat(),
@@ -584,12 +656,13 @@ class Monitor:
             temp = self.state_file.with_name(self.state_file.name + ".tmp")
             temp.write_text(json.dumps(data, indent=2), encoding="utf-8")
             temp.replace(self.state_file)
-        except OSError as exc:
-            LOG.error("could not write state file: %s", exc)
+        except OSError:
+            LOG.exception("could not write state file")
 
     # --- Checks -----------------------------------------------------------
 
     def check_tunnel(self) -> bool:
+        """Return True if the WireGuard handshake is recent enough."""
         if self.nudge_target:
             nudge_tunnel(self.nudge_target)
 
@@ -603,12 +676,38 @@ class Monitor:
 
     def run_cycle(self, *, silent: bool = False) -> None:
         """
-        One full round of checks.
+        Run one full round of checks.
 
         With silent=True the results are recorded but no alerts are sent.
         Used on startup to establish a baseline.
         """
         now = time.time()
+        self._update_tunnel(now, silent=silent)
+
+        # No point checking hosts we cannot reach
+        if self.tunnel_up is False:
+            LOG.info("tunnel down, skipping host checks")
+            self.publish_mqtt_state()
+            self.save_state()
+            return
+
+        newly_down, newly_up = self._check_hosts(now)
+
+        if not silent:
+            self.report(newly_down, newly_up, now)
+
+        status = ", ".join(f"{h.name}={'up' if h.up else 'DOWN'}" for h in self.hosts)
+        LOG.debug(
+            "cycle complete — tunnel=%s | %s",
+            "up" if self.tunnel_up else "DOWN",
+            status,
+        )
+
+        self.publish_mqtt_state()
+        self.save_state()
+
+    def _update_tunnel(self, now: float, *, silent: bool) -> None:
+        """Probe the tunnel and update its verdict, alerting when it flips."""
         tunnel_ok = self.check_tunnel()
 
         if tunnel_ok:
@@ -644,13 +743,8 @@ class Monitor:
                     f"The tunnel is back up after {humanize(was_down_for)}.",
                 )
 
-        # No point checking hosts we cannot reach
-        if self.tunnel_up is False:
-            LOG.info("tunnel down, skipping host checks")
-            self.publish_mqtt_state()
-            self.save_state()
-            return
-
+    def _check_hosts(self, now: float) -> tuple[list[Host], list[tuple[Host, float]]]:
+        """Probe every enabled host and return what changed this cycle."""
         newly_down: list[Host] = []
         newly_up: list[tuple[Host, float]] = []
 
@@ -677,21 +771,12 @@ class Monitor:
                 host.down_since = None
                 host.last_reminder = None
 
-        if not silent:
-            self.report(newly_down, newly_up, now)
-
-        status = ", ".join(
-            f"{h.name}={'up' if h.up else 'DOWN'}" for h in self.hosts
-        )
-        LOG.debug("cycle complete — tunnel=%s | %s",
-                  "up" if self.tunnel_up else "DOWN", status)
-
-        self.publish_mqtt_state()
-        self.save_state()
+        return newly_down, newly_up
 
     # --- MQTT -------------------------------------------------------------
 
     def publish_mqtt_state(self) -> None:
+        """Mirror the monitor's own health to the broker."""
         if not self.mqtt.enabled:
             return
 
@@ -714,6 +799,40 @@ class Monitor:
 
     # --- Reporting --------------------------------------------------------
 
+    def _gap_line(self, now: float) -> str:
+        """Describe how long the monitor was away, as one line."""
+        if self.previous_seen is None:
+            if self.had_previous_state:
+                return "Restarted, previous downtime unknown"
+            return "First run, no previous state"
+
+        gap = now - self.previous_seen
+        if gap < 0:
+            # The Pi has no battery-backed clock, so on boot the time can
+            # briefly run ahead of reality until NTP corrects it.
+            return "Restarted (clock had not synced yet, gap unknown)"
+        if gap >= self.gap_threshold:
+            return (
+                f"**Monitor was offline for {humanize(gap)}** "
+                f"(last check {local_time(self.previous_seen)})"
+            )
+        return f"Restarted after {humanize(gap)}"
+
+    def _hardware_line(self) -> str | None:
+        """Summarise local hardware health, or None if there is nothing to say."""
+        temp = cpu_temperature()
+        flags = throttle_flags() or {}
+        hardware = []
+        if temp is not None:
+            hardware.append(f"{temp} °C")
+        if flags.get("undervoltage_since_boot"):
+            hardware.append("undervoltage detected")
+        if flags.get("throttled_since_boot"):
+            hardware.append("has been throttled")
+        if not hardware:
+            return None
+        return f"**Pi:** {', '.join(hardware)}"
+
     def startup_report(self) -> None:
         """
         Send one message describing the gap and what changed across it.
@@ -725,33 +844,11 @@ class Monitor:
         currently_down = [h.name for h in self.hosts if h.up is False]
         up_count = len(self.hosts) - len(currently_down)
 
-        lines: list[str] = []
-
-        if self.previous_seen is not None:
-            gap = now - self.previous_seen
-            if gap < 0:
-                # The Pi has no battery-backed clock, so on boot the time can
-                # briefly run ahead of reality until NTP corrects it.
-                lines.append("Restarted (clock had not synced yet, gap unknown)")
-            elif gap >= self.gap_threshold:
-                lines.append(
-                    f"**Monitor was offline for {humanize(gap)}** "
-                    f"(last check {local_time(self.previous_seen)})"
-                )
-            else:
-                lines.append(f"Restarted after {humanize(gap)}")
-        elif self.had_previous_state:
-            lines.append("Restarted, previous downtime unknown")
-        else:
-            lines.append("First run, no previous state")
-
-        lines.append("")
+        lines: list[str] = [self._gap_line(now), ""]
         lines.append(f"**Tunnel:** {'up' if self.tunnel_up else 'DOWN'}")
 
         if self.previous_down:
-            lines.append(
-                f"**Was down before the gap:** {', '.join(self.previous_down)}"
-            )
+            lines.append(f"**Was down before the gap:** {', '.join(self.previous_down)}")
         elif self.had_previous_state:
             lines.append("**Was down before the gap:** nothing")
 
@@ -770,20 +867,11 @@ class Monitor:
 
         # Hardware health is worth knowing about right after a restart:
         # an unexpected reboot is often a power problem.
-        temp = cpu_temperature()
-        flags = throttle_flags() or {}
-        hardware = []
-        if temp is not None:
-            hardware.append(f"{temp} °C")
-        if flags.get("undervoltage_since_boot"):
-            hardware.append("undervoltage detected")
-        if flags.get("throttled_since_boot"):
-            hardware.append("has been throttled")
+        hardware = self._hardware_line()
         if hardware:
-            lines.append(f"**Pi:** {', '.join(hardware)}")
+            lines.append(hardware)
 
-        colour = Discord.COLOUR_UP if not currently_down and self.tunnel_up \
-            else Discord.COLOUR_INFO
+        colour = Discord.COLOUR_UP if not currently_down and self.tunnel_up else Discord.COLOUR_INFO
 
         self.discord.send("Monitor started", "\n".join(lines), colour)
         LOG.info("startup report sent")
@@ -794,6 +882,7 @@ class Monitor:
         newly_up: list[tuple[Host, float]],
         now: float,
     ) -> None:
+        """Send alerts for hosts that changed state, then any due reminders."""
         if newly_down:
             lines = [
                 f"• **{h.name}** ({h.address}){f' — {h.note}' if h.note else ''}"
@@ -806,8 +895,7 @@ class Monitor:
 
         if newly_up:
             lines = [
-                f"• **{h.name}** — was down for {humanize(duration)}"
-                for h, duration in newly_up
+                f"• **{h.name}** — was down for {humanize(duration)}" for h, duration in newly_up
             ]
             self.discord.up(
                 f"{len(newly_up)} host{'s' if len(newly_up) > 1 else ''} back online",
@@ -817,6 +905,7 @@ class Monitor:
         self.maybe_remind_hosts(now)
 
     def maybe_remind_tunnel(self, now: float) -> None:
+        """Re-alert about a still-unreachable tunnel, at most once per interval."""
         if self.tunnel_last_reminder is None:
             return
         if now - self.tunnel_last_reminder < self.reminder_seconds:
@@ -830,6 +919,7 @@ class Monitor:
         )
 
     def maybe_remind_hosts(self, now: float) -> None:
+        """Re-alert about hosts that have been down since the last reminder."""
         due = [
             host
             for host in self.hosts
@@ -844,8 +934,7 @@ class Monitor:
             host.last_reminder = now
 
         lines = [
-            f"• **{h.name}** — down for "
-            f"{humanize(now - h.down_since if h.down_since else 0)}"
+            f"• **{h.name}** — down for {humanize(now - h.down_since if h.down_since else 0)}"
             for h in due
         ]
         self.discord.down("Still unreachable", "\n".join(lines))
@@ -853,9 +942,12 @@ class Monitor:
     # --- Main loop --------------------------------------------------------
 
     def run(self) -> None:
+        """Establish a baseline, report it, then check on a fixed interval."""
         LOG.info(
             "starting: %d hosts, %ds interval, alert after %d failed checks",
-            len(self.hosts), self.interval, self.threshold,
+            len(self.hosts),
+            self.interval,
+            self.threshold,
         )
 
         self.mqtt.start()
@@ -880,7 +972,8 @@ class Monitor:
             if elapsed > self.interval:
                 LOG.warning(
                     "cycle took %.1fs, longer than the %ds interval",
-                    elapsed, self.interval,
+                    elapsed,
+                    self.interval,
                 )
             STOP.wait(max(0.0, self.interval - elapsed))
 
@@ -893,15 +986,17 @@ class Monitor:
 # Bootstrap
 # --------------------------------------------------------------------------
 
+
 def load_yaml(path: Path) -> dict[str, Any]:
+    """Load a YAML mapping, exiting with a clear message if it is unusable."""
     if not path.is_file():
         LOG.error("file not found: %s", path)
         sys.exit(1)
 
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except yaml.YAMLError as exc:
-        LOG.error("invalid YAML in %s: %s", path, exc)
+    except yaml.YAMLError:
+        LOG.exception("invalid YAML in %s", path)
         sys.exit(1)
 
     if not isinstance(data, dict):
@@ -912,6 +1007,7 @@ def load_yaml(path: Path) -> dict[str, Any]:
 
 
 def load_hosts(path: Path) -> list[Host]:
+    """Load and validate the host list, exiting on a malformed entry."""
     data = load_yaml(path)
     entries = data.get("hosts", [])
 
@@ -925,8 +1021,8 @@ def load_hosts(path: Path) -> list[Host]:
     for entry in entries:
         try:
             host = Host(**entry)
-        except TypeError as exc:
-            LOG.error("invalid host entry %r: %s", entry, exc)
+        except TypeError:
+            LOG.exception("invalid host entry %r", entry)
             sys.exit(1)
 
         if host.name in seen:
@@ -939,12 +1035,14 @@ def load_hosts(path: Path) -> list[Host]:
     return hosts
 
 
-def handle_signal(signum, frame) -> None:
+def handle_signal(signum: int, _frame: FrameType | None) -> None:
+    """Ask the main loop to stop at the next opportunity."""
     LOG.info("received %s", signal.Signals(signum).name)
     STOP.set()
 
 
 def main() -> int:
+    """Configure logging, load the config, and run until told to stop."""
     logging.basicConfig(
         level=os.environ.get("LYNCEUS_LOGLEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)-7s %(message)s",
@@ -959,8 +1057,8 @@ def main() -> int:
 
     try:
         monitor = Monitor(config, hosts)
-    except (TypeError, ValueError) as exc:
-        LOG.error("configuration error: %s", exc)
+    except (TypeError, ValueError):
+        LOG.exception("configuration error")
         return 1
 
     monitor.run()
