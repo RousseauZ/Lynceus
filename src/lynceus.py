@@ -54,21 +54,16 @@ STOP = threading.Event()
 CONFIG_PATH = Path(os.environ.get("LYNCEUS_CONFIG", "/etc/lynceus/config.yaml"))
 HOSTS_PATH = Path(os.environ.get("LYNCEUS_HOSTS", "/etc/lynceus/hosts.yaml"))
 
-# `wg show <if> latest-handshakes` prints "<peer-key> <unix-timestamp>" per peer.
+# wg prints "<peer> <timestamp>" per line
 WG_HANDSHAKE_FIELDS = 2
 
-# Discord rate-limits aggressively; back off and retry rather than drop an alert.
+# Discord rate-limits, so retry instead of dropping an alert
 DISCORD_MAX_ATTEMPTS = 3
 HTTP_TOO_MANY_REQUESTS = 429
 
 SECONDS_PER_MINUTE = 60
 SECONDS_PER_HOUR = 3600
 SECONDS_PER_DAY = 86400
-
-
-# --------------------------------------------------------------------------
-# Data
-# --------------------------------------------------------------------------
 
 
 @dataclass
@@ -118,11 +113,6 @@ class Host:
                 return True
         except OSError:
             return False
-
-
-# --------------------------------------------------------------------------
-# WireGuard
-# --------------------------------------------------------------------------
 
 
 def handshake_age(interface: str) -> float | None:
@@ -175,11 +165,6 @@ def nudge_tunnel(target: str) -> None:
     )
 
 
-# --------------------------------------------------------------------------
-# Local hardware
-# --------------------------------------------------------------------------
-
-
 def cpu_temperature() -> float | None:
     """Return the CPU temperature in degrees Celsius, or None if unavailable."""
     try:
@@ -193,14 +178,9 @@ def throttle_flags() -> dict[str, bool] | None:
     """
     Read the Raspberry Pi throttling bitmask.
 
-    Bit 0  : undervoltage right now
-    Bit 1  : ARM frequency capped right now
-    Bit 2  : throttled right now
-    Bit 16 : undervoltage has occurred since boot
-    Bit 18 : throttling has occurred since boot
-
-    The "since boot" bits matter most for an unattended machine: a marginal
-    power supply shows up there long before it causes visible trouble.
+    Only the since-boot bits (16 and 18) are read. On an unattended machine
+    those are the ones that matter: the "right now" bits are almost always
+    clear again by the time anyone looks.
     """
     try:
         result = subprocess.run(
@@ -222,27 +202,20 @@ def throttle_flags() -> dict[str, bool] | None:
 
     value = int(match.group(1), 16)
     return {
-        "undervoltage_now": bool(value & 0x1),
-        "throttled_now": bool(value & 0x4),
         "undervoltage_since_boot": bool(value & 0x10000),
         "throttled_since_boot": bool(value & 0x40000),
     }
 
 
-# --------------------------------------------------------------------------
-# Notifications
-# --------------------------------------------------------------------------
-
-
 class Discord:
-    """Sends embed messages to a Discord webhook, with retries on rate limits."""
+    """Sends embed messages to a Discord webhook."""
 
     COLOUR_DOWN = 0xE74C3C
     COLOUR_UP = 0x2ECC71
     COLOUR_INFO = 0x3498DB
 
     def __init__(self, webhook_url: str, username: str = "Lynceus") -> None:
-        """Store the webhook, rejecting anything that is not an https:// url."""
+        """Store the webhook, refusing anything that is not https."""
         if webhook_url and not webhook_url.startswith("https://"):
             msg = "discord webhook_url must be an https:// url"
             raise ValueError(msg)
@@ -250,7 +223,7 @@ class Discord:
         self.username = username
 
     def send(self, title: str, description: str, colour: int) -> None:
-        """Post one embed, retrying on rate limits and transient network errors."""
+        """Post one embed, with retries."""
         if not self.webhook_url:
             LOG.warning("no webhook configured, message dropped: %s", title)
             return
@@ -267,8 +240,7 @@ class Discord:
             ],
         }
 
-        # S310: the scheme is pinned to https:// in __init__, so this cannot be
-        # talked into opening file: or a custom scheme.
+        # scheme is pinned to https in __init__
         request = urllib.request.Request(  # noqa: S310
             self.webhook_url,
             data=json.dumps(payload).encode("utf-8"),
@@ -295,40 +267,29 @@ class Discord:
                     time.sleep(5)
 
     def down(self, title: str, description: str) -> None:
-        """Send a message in the "something is broken" colour."""
+        """Send a message in the down colour."""
         self.send(title, description, self.COLOUR_DOWN)
 
     def up(self, title: str, description: str) -> None:
-        """Send a message in the "recovered" colour."""
+        """Send a message in the recovered colour."""
         self.send(title, description, self.COLOUR_UP)
-
-    def info(self, title: str, description: str) -> None:
-        """Send a neutral, informational message."""
-        self.send(title, description, self.COLOUR_INFO)
-
-
-# --------------------------------------------------------------------------
-# MQTT / Home Assistant
-# --------------------------------------------------------------------------
 
 
 class MqttPublisher:
     """
     Mirrors the monitor's own health to Home Assistant.
 
-    This publishes entities describing the monitor, not the hosts it watches —
-    those are already covered by Discord alerts. The point here is the other
-    half of the failover: if this Pi dies, Home Assistant notices the
-    availability topic go stale and can tell you.
+    The entities describe the monitor, not the hosts it watches — those are
+    already covered by Discord. This is the other half of the failover: if
+    this Pi dies, Home Assistant sees the availability topic go stale.
 
-    Every failure is swallowed and logged. A broken broker must never stop the
-    checks or the Discord alerts. That is why the handlers below catch Exception
-    broadly: paho raises a wide range of errors depending on the transport, and
-    none of them may be fatal here.
+    Every failure here is swallowed and logged. A broken broker must never
+    stop the checks or the Discord alerts, so the handlers below catch
+    Exception broadly on purpose.
     """
 
     def __init__(self, config: dict[str, Any]) -> None:
-        """Read the mqtt section of the config and prepare the client."""
+        """Read the mqtt config and prepare the client."""
         self.enabled = bool(config.get("enabled", False)) and bool(config.get("host"))
         if not self.enabled:
             return
@@ -349,7 +310,6 @@ class MqttPublisher:
         self.availability_topic = f"{self.base}/availability"
         self.state_topic = f"{self.base}/state"
         self.connected = False
-        self.discovery_sent = False
 
         self.client = mqtt.Client(
             mqtt.CallbackAPIVersion.VERSION2,
@@ -364,7 +324,7 @@ class MqttPublisher:
         self.client.on_disconnect = self._on_disconnect
 
     def start(self) -> None:
-        """Connect to the broker in the background, disabling mqtt if it fails."""
+        """Connect in the background, disabling mqtt if it fails."""
         if not self.enabled:
             return
         try:
@@ -377,7 +337,7 @@ class MqttPublisher:
 
     def _on_connect(
         self,
-        client: Any,  # noqa: ANN401 - paho hands us its own client type
+        client: mqtt.Client,
         _userdata: object,
         _flags: object,
         reason_code: object,
@@ -402,8 +362,6 @@ class MqttPublisher:
         self.connected = False
         if not STOP.is_set():
             LOG.warning("mqtt: disconnected (%s), will retry", reason_code)
-
-    # --- Discovery --------------------------------------------------------
 
     def _device(self) -> dict[str, Any]:
         return {
@@ -481,15 +439,12 @@ class MqttPublisher:
                 },
             )
 
-            self.discovery_sent = True
             LOG.info("mqtt: discovery published")
         except Exception:
             LOG.exception("mqtt: could not publish discovery")
 
-    # --- State ------------------------------------------------------------
-
     def publish_state(self, payload: dict[str, Any]) -> None:
-        """Publish the current monitor state, if the broker is connected."""
+        """Publish the current state, if the broker is connected."""
         if not self.enabled or not self.connected:
             return
         try:
@@ -498,7 +453,7 @@ class MqttPublisher:
             LOG.exception("mqtt: could not publish state")
 
     def shutdown(self) -> None:
-        """Mark the monitor offline and close the connection cleanly."""
+        """Mark us offline and close the connection."""
         if not self.enabled:
             return
         try:
@@ -508,11 +463,6 @@ class MqttPublisher:
             self.client.disconnect()
         except Exception:
             LOG.debug("mqtt: error while shutting down", exc_info=True)
-
-
-# --------------------------------------------------------------------------
-# Helpers
-# --------------------------------------------------------------------------
 
 
 def humanize(seconds: float) -> str:
@@ -531,28 +481,21 @@ def humanize(seconds: float) -> str:
 
 def local_time(epoch: float) -> str:
     """Format an epoch timestamp in the machine's local timezone."""
-    # Parsed as UTC and then converted, so the timezone is explicit rather
-    # than implied by the process environment.
+    # UTC first, so the timezone is explicit rather than implied
     return datetime.fromtimestamp(epoch, tz=UTC).astimezone().strftime("%d %b %H:%M")
 
 
-# --------------------------------------------------------------------------
-# Monitor
-# --------------------------------------------------------------------------
-
-
 class Monitor:
-    """Owns the check loop, the alerting decisions, and the persisted state."""
+    """Owns the check loop, the alerting, and the saved state."""
 
     def __init__(self, config: dict[str, Any], hosts: list[Host]) -> None:
-        """Build a monitor from the parsed config and host list."""
+        """Build a monitor from the config and host list."""
         general = config.get("general", {})
         self.interval: int = int(general.get("interval", 60))
         self.threshold: int = int(general.get("failure_threshold", 3))
         self.reminder_seconds: int = int(general.get("reminder_hours", 6)) * SECONDS_PER_HOUR
 
-        # A gap larger than this counts as "the monitor was away" rather than
-        # a quick service restart. Defaults to four missed cycles.
+        # a bigger gap than this means we were away, not just restarted
         self.gap_threshold: int = int(general.get("startup_gap_threshold", self.interval * 4))
 
         wg = config.get("wireguard", {})
@@ -581,15 +524,12 @@ class Monitor:
         self.tunnel_down_since: float | None = None
         self.tunnel_last_reminder: float | None = None
 
-        # What the world looked like the last time we wrote state, used for
-        # the startup report. Filled in by load_state().
+        # how things looked before the gap, filled in by load_state()
         self.previous_seen: float | None = None
         self.previous_down: list[str] = []
         self.had_previous_state = False
 
         self.load_state()
-
-    # --- Persistence ------------------------------------------------------
 
     def load_state(self) -> None:
         """Restore the previous state so a restart does not replay alerts."""
@@ -632,7 +572,7 @@ class Monitor:
         LOG.info("restored state from %s", self.state_file)
 
     def save_state(self) -> None:
-        """Write the current state atomically, so a crash cannot corrupt it."""
+        """Write the state to disk."""
         now = time.time()
         data = {
             "updated": datetime.now(UTC).isoformat(),
@@ -652,17 +592,15 @@ class Monitor:
 
         try:
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
-            # Write to a temp file first so a crash mid-write cannot corrupt it
+            # temp file first, so a crash mid-write cannot corrupt it
             temp = self.state_file.with_name(self.state_file.name + ".tmp")
             temp.write_text(json.dumps(data, indent=2), encoding="utf-8")
             temp.replace(self.state_file)
         except OSError:
             LOG.exception("could not write state file")
 
-    # --- Checks -----------------------------------------------------------
-
     def check_tunnel(self) -> bool:
-        """Return True if the WireGuard handshake is recent enough."""
+        """Return True if the handshake is recent enough."""
         if self.nudge_target:
             nudge_tunnel(self.nudge_target)
 
@@ -707,7 +645,7 @@ class Monitor:
         self.save_state()
 
     def _update_tunnel(self, now: float, *, silent: bool) -> None:
-        """Probe the tunnel and update its verdict, alerting when it flips."""
+        """Update the tunnel verdict, alerting when it flips."""
         tunnel_ok = self.check_tunnel()
 
         if tunnel_ok:
@@ -744,7 +682,7 @@ class Monitor:
                 )
 
     def _check_hosts(self, now: float) -> tuple[list[Host], list[tuple[Host, float]]]:
-        """Probe every enabled host and return what changed this cycle."""
+        """Probe every host and return what changed."""
         newly_down: list[Host] = []
         newly_up: list[tuple[Host, float]] = []
 
@@ -773,10 +711,8 @@ class Monitor:
 
         return newly_down, newly_up
 
-    # --- MQTT -------------------------------------------------------------
-
     def publish_mqtt_state(self) -> None:
-        """Mirror the monitor's own health to the broker."""
+        """Push our own health to the broker."""
         if not self.mqtt.enabled:
             return
 
@@ -785,22 +721,17 @@ class Monitor:
 
         payload = {
             "tunnel_up": bool(self.tunnel_up),
-            "hosts_total": len(self.hosts),
             "hosts_up": len(self.hosts) - len(down_names),
-            "hosts_down": len(down_names),
             "hosts_down_names": ", ".join(down_names) if down_names else "none",
             "cpu_temperature": cpu_temperature(),
-            "undervoltage_now": flags.get("undervoltage_now", False),
             "undervoltage_since_boot": flags.get("undervoltage_since_boot", False),
             "throttled_since_boot": flags.get("throttled_since_boot", False),
             "last_check": datetime.now(UTC).isoformat(timespec="seconds"),
         }
         self.mqtt.publish_state(payload)
 
-    # --- Reporting --------------------------------------------------------
-
     def _gap_line(self, now: float) -> str:
-        """Describe how long the monitor was away, as one line."""
+        """Say how long we were away, in one line."""
         if self.previous_seen is None:
             if self.had_previous_state:
                 return "Restarted, previous downtime unknown"
@@ -808,8 +739,7 @@ class Monitor:
 
         gap = now - self.previous_seen
         if gap < 0:
-            # The Pi has no battery-backed clock, so on boot the time can
-            # briefly run ahead of reality until NTP corrects it.
+            # no RTC, so the clock can run ahead until NTP catches up
             return "Restarted (clock had not synced yet, gap unknown)"
         if gap >= self.gap_threshold:
             return (
@@ -819,7 +749,7 @@ class Monitor:
         return f"Restarted after {humanize(gap)}"
 
     def _hardware_line(self) -> str | None:
-        """Summarise local hardware health, or None if there is nothing to say."""
+        """Sum up the Pi's own health, or None if there is nothing to say."""
         temp = cpu_temperature()
         flags = throttle_flags() or {}
         hardware = []
@@ -865,8 +795,7 @@ class Monitor:
         if newly and self.had_previous_state:
             lines.append(f"**Failed while offline:** {', '.join(newly)}")
 
-        # Hardware health is worth knowing about right after a restart:
-        # an unexpected reboot is often a power problem.
+        # an unexpected reboot is often a power problem
         hardware = self._hardware_line()
         if hardware:
             lines.append(hardware)
@@ -882,7 +811,7 @@ class Monitor:
         newly_up: list[tuple[Host, float]],
         now: float,
     ) -> None:
-        """Send alerts for hosts that changed state, then any due reminders."""
+        """Alert on hosts that changed state, then send due reminders."""
         if newly_down:
             lines = [
                 f"• **{h.name}** ({h.address}){f' — {h.note}' if h.note else ''}"
@@ -905,7 +834,7 @@ class Monitor:
         self.maybe_remind_hosts(now)
 
     def maybe_remind_tunnel(self, now: float) -> None:
-        """Re-alert about a still-unreachable tunnel, at most once per interval."""
+        """Nag about a tunnel that is still down."""
         if self.tunnel_last_reminder is None:
             return
         if now - self.tunnel_last_reminder < self.reminder_seconds:
@@ -919,7 +848,7 @@ class Monitor:
         )
 
     def maybe_remind_hosts(self, now: float) -> None:
-        """Re-alert about hosts that have been down since the last reminder."""
+        """Nag about hosts that are still down."""
         due = [
             host
             for host in self.hosts
@@ -939,10 +868,8 @@ class Monitor:
         ]
         self.discord.down("Still unreachable", "\n".join(lines))
 
-    # --- Main loop --------------------------------------------------------
-
     def run(self) -> None:
-        """Establish a baseline, report it, then check on a fixed interval."""
+        """Take a baseline, report it, then loop."""
         LOG.info(
             "starting: %d hosts, %ds interval, alert after %d failed checks",
             len(self.hosts),
@@ -952,9 +879,7 @@ class Monitor:
 
         self.mqtt.start()
 
-        # Establish a baseline without alerting, so a restart does not produce
-        # a flood of individual messages. The startup report below covers what
-        # changed in one go instead.
+        # baseline without alerting, the startup report covers it in one go
         LOG.info("running silent baseline cycle")
         self.run_cycle(silent=True)
         LOG.info("baseline established, alerts enabled")
@@ -982,13 +907,8 @@ class Monitor:
         self.mqtt.shutdown()
 
 
-# --------------------------------------------------------------------------
-# Bootstrap
-# --------------------------------------------------------------------------
-
-
 def load_yaml(path: Path) -> dict[str, Any]:
-    """Load a YAML mapping, exiting with a clear message if it is unusable."""
+    """Load a YAML mapping, or exit with a clear message."""
     if not path.is_file():
         LOG.error("file not found: %s", path)
         sys.exit(1)
@@ -1007,7 +927,7 @@ def load_yaml(path: Path) -> dict[str, Any]:
 
 
 def load_hosts(path: Path) -> list[Host]:
-    """Load and validate the host list, exiting on a malformed entry."""
+    """Load and check the host list, or exit."""
     data = load_yaml(path)
     entries = data.get("hosts", [])
 
@@ -1036,13 +956,13 @@ def load_hosts(path: Path) -> list[Host]:
 
 
 def handle_signal(signum: int, _frame: FrameType | None) -> None:
-    """Ask the main loop to stop at the next opportunity."""
+    """Ask the main loop to stop."""
     LOG.info("received %s", signal.Signals(signum).name)
     STOP.set()
 
 
 def main() -> int:
-    """Configure logging, load the config, and run until told to stop."""
+    """Set up logging, load the config, and run."""
     logging.basicConfig(
         level=os.environ.get("LYNCEUS_LOGLEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)-7s %(message)s",
