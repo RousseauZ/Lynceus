@@ -4,30 +4,19 @@ line-length = 100
 src = ["src"]
 
 [tool.ruff.lint]
-# Everything on, then subtract. New rules in a future ruff arrive enabled
-# rather than silently missing, which is the point of opt-out over opt-in.
+# everything on, then subtract, so new ruff rules arrive enabled
 select = ["ALL"]
 
 ignore = [
-    # --- Mutually exclusive pairs: ruff requires one of each to be off ---
-    # D203/D211 disagree about a blank line before a class docstring; D211 (none) wins.
+    # D203/D211 and D212/D213 conflict, one of each has to go
     "D203",
-    # D212/D213 disagree about where a multi-line summary starts; D213 (second
-    # line) wins, which is the style used throughout this file.
     "D212",
-
-    # --- Conflicts with `ruff format` ---
-    # The formatter decides trailing commas; leaving COM812 on fights it.
+    # the formatter decides trailing commas
     "COM812",
-
-    # --- Deliberate, with a reason ---
-    # Every subprocess call here is a fixed argv list of a system tool (ping, wg,
-    # vcgencmd) with no shell and no user-controlled executable. Absolute paths
-    # differ between Raspberry Pi OS and Debian, so hard-coding them would be
-    # more fragile than this is risky.
+    # fixed argv lists of system tools, no shell, paths differ per distro
     "S603",
     "S607",
-    # No copyright header on a personal repo.
+    # no copyright header on a personal repo
     "CPY001",
 ]
 
