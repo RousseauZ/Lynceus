@@ -1,18 +1,18 @@
 [Unit]
-Description=Lynceus
-After=network-online.target wg-quick@wg0.service
-Wants=network-online.target
+Description=Lynceus offsite monitor
+After=network-online.target wg-quick@wg0.service time-sync.target
+Wants=network-online.target time-sync.target
 
 [Service]
 Type=simple
 User=root
 
-Environment=Lynceus_CONFIG=/etc/Lynceus/config.yaml
-Environment=Lynceus_HOSTS=/etc/Lynceus/hosts.yaml
-Environment=Lynceus_LOGLEVEL=INFO
+Environment=LYNCEUS_CONFIG=/etc/lynceus/config.yaml
+Environment=LYNCEUS_HOSTS=/etc/lynceus/hosts.yaml
+Environment=LYNCEUS_LOGLEVEL=INFO
 Environment=PYTHONUNBUFFERED=1
 
-ExecStart=/opt/Lynceus/venv/bin/python /opt/Lynceus/Lynceus.py
+ExecStart=/opt/lynceus/venv/bin/python /opt/lynceus/lynceus.py
 
 Restart=always
 RestartSec=15
@@ -26,12 +26,12 @@ ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictRealtime=true
 LockPersonality=true
-ReadWritePaths=/var/lib/Lynceus
-ReadOnlyPaths=/etc/Lynceus
+ReadWritePaths=/var/lib/lynceus
+ReadOnlyPaths=/etc/lynceus
 
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=Lynceus
+SyslogIdentifier=lynceus
 
 [Install]
 WantedBy=multi-user.target
