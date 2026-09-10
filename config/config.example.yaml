@@ -1,7 +1,7 @@
 # config.yaml — settings for the monitor itself.
 # The list of machines lives in hosts.yaml.
 #
-# Copy this to /etc/Lynceus/config.yaml and fill in your own values.
+# Copy this to /etc/lynceus/config.yaml and fill in your own values.
 # The real file is never committed: it holds the webhook and broker password.
 
 general:
@@ -17,12 +17,11 @@ general:
   # missed at night is still visible in the morning.
   reminder_hours: 6
 
-  # A gap longer than this between the last saved state and startup counts
-  # as "the monitor was away" rather than a quick service restart.
-  # Defaults to four missed cycles when omitted.
+  # A gap longer than this counts as "the monitor was away" rather than a
+  # quick restart. Defaults to four missed cycles when omitted.
   startup_gap_threshold: 240
 
-  state_file: /var/lib/Lynceus/state.json
+  state_file: /var/lib/lynceus/state.json
 
 wireguard:
   interface: wg0
@@ -45,15 +44,16 @@ discord:
 
 mqtt:
   # Optional. Mirrors the monitor's own health to Home Assistant so you get
-  # told when this Pi dies. Set enabled to false to run without it —
-  # Discord alerting does not depend on the broker.
+  # told when this Pi dies. Discord alerting does not depend on the broker.
   enabled: true
 
   host: 192.168.1.110
   port: 1883
-  username: Lynceus
+  username: lynceus
   password: CHANGE_ME
 
-  base_topic: Lynceus
+  # Changing node_id creates new entities in Home Assistant and orphans
+  # the old ones. Pick it once.
+  base_topic: lynceus
   discovery_prefix: homeassistant
-  node_id: Lynceus
+  node_id: lynceus
