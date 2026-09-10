@@ -12,10 +12,10 @@ jobs:
 
     steps:
       - name: Check out the code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.13"
 
@@ -32,10 +32,9 @@ jobs:
           python -c "import yaml; yaml.safe_load(open('config/config.example.yaml')); print('config OK')"
           python -c "import yaml; yaml.safe_load(open('config/hosts.example.yaml')); print('hosts OK')"
 
-      # Pinned on purpose: an unpinned ruff picks up new rules over time and
-      # breaks CI on code that was never touched. Bump this deliberately.
-      # Rules and ignores live in pyproject.toml, not in this workflow.
+      # pinned on purpose, a new ruff would break CI on untouched code
       - name: Lint
         run: |
           pip install ruff==0.16.5
           ruff check src/
+          ruff format --check src/
