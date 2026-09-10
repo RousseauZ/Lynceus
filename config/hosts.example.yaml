@@ -13,8 +13,10 @@
 #
 # Use tcp when you care about a service rather than the machine: a host can
 # answer a ping while the service on it is dead.
+#
+# A restart is needed after editing this file.
 
-  hosts:
+hosts:
   - name: Router
     address: 192.168.1.1
     check: icmp
@@ -22,3 +24,9 @@
   - name: Hypervisor
     address: 192.168.1.10
     check: icmp
+
+  - name: Home Assistant
+    address: 192.168.1.110
+    check: tcp
+    port: 8123
+    note: check the container first, then the host
